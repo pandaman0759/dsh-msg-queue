@@ -391,10 +391,11 @@ window.__ModuleLoader__.load({
         notify('先打开一个会话再发送')
         return
       }
-      Promise.resolve(sender.send(item.text, item.images)).then(function (accepted) {
-        if (!accepted) return
+      Promise.resolve(sender.send(item.text, item.images)).then(function (result) {
+        if (!result) return
         removeItem(id)
-        notify('已发送')
+        if (result === 'filled') notify('附件已放进输入框，按回车发送')
+        else notify('已发送')
         // 发出去就收起面板（点了「发送」就不用再点一次底部按钮）
         setCollapsed(true)
       }).catch(function (err) {
@@ -538,11 +539,13 @@ window.__ModuleLoader__.load({
             actions.setDraft(expected)
             await wait(SUBMIT_DELAY_MS)
 
-            /* 附件是异步上传的：附件总数到齐 ≠ 上传完成，这时提交会被宿主拒绝
-               （toast：one or more files have not finished uploading）。所以提交后看结果，
-               没进去就等一会儿再提交一次；带附件时给更长的窗口（大文件上传慢）。 */
-            const attempts = list.length > 0 ? 16 : 6
-            for (let attempt = 0; attempt < attempts; attempt += 1) {
+            /* 附件上传是宿主侧的异步过程，插件读不到它的完成状态。
+               所以带附件的条目**不自动提交**：把附件和文字放进输入框就交还给你，
+               按一下回车即发 —— 上传失败你能当场看到、点重试，不会和提交赛跑。 */
+            if (list.length > 0) return 'filled'
+
+            /* 文本条目：提交后看结果，没进去就在稍后重提（最多 6 次）。 */
+            for (let attempt = 0; attempt < 6; attempt += 1) {
               try {
                 actions.submit()
               } catch (err) {
@@ -551,19 +554,19 @@ window.__ModuleLoader__.load({
               }
               await wait(attempt === 0 ? 450 : 350)
               const phase = readPhase()
-              if (phase !== 'plain') return true
+              if (phase !== 'plain') return 'sent'
               let now = ''
               try {
                 now = String(readDraft() || '')
               } catch (err) {
                 now = ''
               }
-              if (now !== expected) return true
-              if (readAttachCount() < before) return true
-              if (attempt === attempts - 1) break
+              if (now !== expected) return 'sent'
+              if (readAttachCount() < before) return 'sent'
+              if (attempt === 5) break
               await wait(250)
             }
-            notify('没发出去（附件可能还在上传），这条先留在队列里')
+            notify('没发出去，这条先留在队列里')
             return false
           },
         })
