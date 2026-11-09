@@ -848,6 +848,11 @@ window.__ModuleLoader__.load({
         for (const file of files) {
           if (!file) continue
           const type = file.type || ''
+          // 只收图片：宿主的粘贴上传通道对非图片文件会直接"上传失败"（实测 .txt）。
+          if (!/^image\//.test(type)) {
+            lastError = '只收图片（其它文件宿主上传通道不收）'
+            continue
+          }
           if (file.size > MAX_FILE_BYTES) {
             lastError = '文件太大（上限 16MB）'
             continue
@@ -999,12 +1004,13 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'dsmq-add',
-            title: '添加图片或文件',
-            'aria-label': '添加图片或文件',
+            title: '添加图片',
+            'aria-label': '添加图片',
             onClick() { if (fileRef.current) fileRef.current.click() },
           }, '+'),
           h('input', {
             type: 'file',
+            accept: 'image/*',
             multiple: true,
             ref: fileRef,
             style: { display: 'none' },
