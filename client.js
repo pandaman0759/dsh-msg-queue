@@ -72,12 +72,12 @@ window.__ModuleLoader__.load({
       return String(value == null ? '' : value).replace(/\r\n/g, '\n').trim()
     }
 
-    /* ── 图片：字节存 IndexedDB（localStorage 放不下），条目里只留 {id,name,type} ── */
+    /* ── 附件：字节存 IndexedDB（localStorage 放不下），条目里只留 {id,name,type} ── */
 
     const DB_NAME = 'dsh-msg-queue'
     const DB_STORE = 'images'
-    /** 单张图上限，超过就不收（会话附件本身也有上限，这里只是先挡一道）。 */
-    const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+    /** 单个附件上限，超过就不收（宿主上传通道本身也有上限，这里只是先挡一道）。 */
+    const MAX_FILE_BYTES = 16 * 1024 * 1024
 
     let dbPromise = null
     function openDb() {
@@ -178,8 +178,26 @@ window.__ModuleLoader__.load({
       return url
     }
 
+    function isImageType(type) {
+      return /^image\//.test(String(type || ''))
+    }
+
+    /** 非图片附件的角标：取扩展名，认不出就写 FILE。 */
+    function fileExtLabel(name) {
+      const raw = String(name || '')
+      const dot = raw.lastIndexOf('.')
+      if (dot > 0 && raw.length - dot <= 7) return raw.slice(dot + 1).toUpperCase().slice(0, 5)
+      return 'FILE'
+    }
+
     function Thumb(props) {
       const url = useThumbUrl(props.image)
+      if (!isImageType(props.image.type)) {
+        return h('span', {
+          className: 'dsmq-thumb dsmq-file',
+          title: props.image.name || '',
+        }, h('span', { className: 'dsmq-file-ext' }, fileExtLabel(props.image.name)))
+      }
       if (!url) return h('span', { className: 'dsmq-thumb dsmq-thumb-empty' }, '')
       return h('img', {
         className: 'dsmq-thumb',
@@ -435,7 +453,7 @@ window.__ModuleLoader__.load({
       try {
         const blob = record.blob
         if (!blob) return null
-        const type = record.type || image.type || 'image/png'
+        const type = record.type || image.type || 'application/octet-stream'
         const name = record.name || image.name || 'image.png'
         return new File([blob], name, { type })
       } catch (err) {
@@ -504,15 +522,15 @@ window.__ModuleLoader__.load({
                 await wait(120)
               }
               if (dispatched === 0) {
-                notify('图片读不出来，这条先留在队列里')
+                notify('附件读不出来，这条先留在队列里')
                 return false
               }
-              const deadline = Date.now() + 4000
+              const deadline = Date.now() + 6000
               while (Date.now() < deadline && readAttachCount() < before + dispatched) {
                 await wait(80)
               }
               if (readAttachCount() < before + dispatched) {
-                notify('图片没能自动附进输入框，这条先留在队列里')
+                notify('附件没能自动附进输入框，这条先留在队列里')
                 return false
               }
             }
@@ -522,8 +540,9 @@ window.__ModuleLoader__.load({
 
             /* 附件是异步上传的：附件总数到齐 ≠ 上传完成，这时提交会被宿主拒绝
                （toast：one or more files have not finished uploading）。所以提交后看结果，
-               没进去就等一会儿再提交一次，最多约 8 次。 */
-            for (let attempt = 0; attempt < 8; attempt += 1) {
+               没进去就等一会儿再提交一次；带附件时给更长的窗口（大文件上传慢）。 */
+            const attempts = list.length > 0 ? 16 : 6
+            for (let attempt = 0; attempt < attempts; attempt += 1) {
               try {
                 actions.submit()
               } catch (err) {
@@ -541,7 +560,7 @@ window.__ModuleLoader__.load({
               }
               if (now !== expected) return true
               if (readAttachCount() < before) return true
-              if (attempt === 7) break
+              if (attempt === attempts - 1) break
               await wait(250)
             }
             notify('没发出去（附件可能还在上传），这条先留在队列里')
@@ -745,6 +764,9 @@ window.__ModuleLoader__.load({
       '.dsmq-thumb{display:block;width:44px;height:44px;object-fit:cover;border-radius:6px;',
       'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));',
       'background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.1))}',
+      /* 非图片附件：一个方块里写扩展名，和缩略图同样大小 */
+      '.dsmq-file{display:flex;align-items:center;justify-content:center;box-sizing:border-box}',
+      '.dsmq-file-ext{font-size:10px;font-weight:600;letter-spacing:.3px;color:var(--dsw-alias-label-secondary,#5c626b)}',
       '.dsmq-thumb-x{position:absolute;top:-4px;right:-4px;width:16px;height:16px;padding:0;border-radius:8px;border:0;',
       'display:flex;align-items:center;justify-content:center;cursor:pointer;font:11px/1 system-ui;',
       'background:var(--dsw-alias-bg-layer-2,rgba(80,84,90,.9));color:var(--dsw-alias-label-primary,#fff)}',
@@ -823,12 +845,8 @@ window.__ModuleLoader__.load({
         for (const file of files) {
           if (!file) continue
           const type = file.type || ''
-          if (type && !/^image\//.test(type)) {
-            lastError = '只收图片'
-            continue
-          }
-          if (file.size > MAX_IMAGE_BYTES) {
-            lastError = '图片太大（上限 8MB）'
+          if (file.size > MAX_FILE_BYTES) {
+            lastError = '文件太大（上限 16MB）'
             continue
           }
           const entry = {
@@ -846,8 +864,8 @@ window.__ModuleLoader__.load({
           added += 1
         }
         setStaged(next)
-        if (added > 0) notify(added === 1 ? '图片已加入' : ('已加入 ' + added + ' 张图'))
-        else if (lastError) notify('存不下图：' + lastError)
+        if (added > 0) notify(added === 1 ? '附件已加入' : ('已加入 ' + added + ' 个附件'))
+        else if (lastError) notify('存不下：' + lastError)
       }
 
       function commitDraft() {
@@ -978,13 +996,12 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'dsmq-add',
-            title: '添加图片',
-            'aria-label': '添加图片',
+            title: '添加图片或文件',
+            'aria-label': '添加图片或文件',
             onClick() { if (fileRef.current) fileRef.current.click() },
           }, '+'),
           h('input', {
             type: 'file',
-            accept: 'image/*',
             multiple: true,
             ref: fileRef,
             style: { display: 'none' },
