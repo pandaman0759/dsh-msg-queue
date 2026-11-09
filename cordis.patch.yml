@@ -1,0 +1,6 @@
+# dsh-msg-queue —— 挂载声明
+# 把本插件作为一行插入当前 profile 的 cordis 配置树；
+# 浏览器产物（client.js）由 dsh-client-modules 依据这一行扫描加载。
+- insert:
+    - id: msg-queue
+      name: dsh-msg-queue
