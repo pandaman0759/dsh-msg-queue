@@ -72,16 +72,128 @@ window.__ModuleLoader__.load({
       return String(value == null ? '' : value).replace(/\r\n/g, '\n').trim()
     }
 
+    /* ── 图片：字节存 IndexedDB（localStorage 放不下），条目里只留 {id,name,type} ── */
+
+    const DB_NAME = 'dsh-msg-queue'
+    const DB_STORE = 'images'
+    /** 单张图上限，超过就不收（会话附件本身也有上限，这里只是先挡一道）。 */
+    const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+    let dbPromise = null
+    function openDb() {
+      if (dbPromise) return dbPromise
+      dbPromise = new Promise(function (resolve, reject) {
+        let req
+        try {
+          req = window.indexedDB.open(DB_NAME, 1)
+        } catch (err) {
+          reject(err)
+          return
+        }
+        req.onupgradeneeded = function () {
+          const db = req.result
+          if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE)
+        }
+        req.onsuccess = function () { resolve(req.result) }
+        req.onerror = function () { reject(req.error) }
+      })
+      return dbPromise
+    }
+
+    function dbRequest(mode, run) {
+      return openDb().then(function (db) {
+        return new Promise(function (resolve, reject) {
+          const tx = db.transaction(DB_STORE, mode)
+          const store = tx.objectStore(DB_STORE)
+          let result
+          try {
+            result = run(store)
+          } catch (err) {
+            reject(err)
+            return
+          }
+          tx.oncomplete = function () { resolve(result && 'result' in result ? result.result : undefined) }
+          tx.onerror = function () { reject(tx.error) }
+          tx.onabort = function () { reject(tx.error) }
+        })
+      })
+    }
+
+    function putImage(id, record) {
+      return dbRequest('readwrite', function (store) { return store.put(record, id) })
+    }
+
+    function getImage(id) {
+      return dbRequest('readonly', function (store) { return store.get(id) })
+    }
+
+    function dropImages(ids) {
+      if (!ids || ids.length === 0) return Promise.resolve()
+      return dbRequest('readwrite', function (store) {
+        for (const id of ids) store.delete(id)
+      }).catch(function () { /* 删不掉只是占点空间 */ })
+    }
+
+    function normalizeImages(raw) {
+      const out = []
+      if (!Array.isArray(raw)) return out
+      for (const entry of raw) {
+        if (!entry || typeof entry.id !== 'string' || !entry.id) continue
+        out.push({
+          id: entry.id,
+          name: typeof entry.name === 'string' && entry.name ? entry.name : 'image',
+          type: typeof entry.type === 'string' && entry.type ? entry.type : 'image/png',
+        })
+      }
+      return out
+    }
+
+    /* 缩略图 URL 缓存：同一个 id 只生成一次 objectURL（页面生命周期内有效）。 */
+    const thumbUrls = new Map()
+
+    function useThumbUrl(entry) {
+      const [url, setUrl] = React.useState(function () { return thumbUrls.get(entry.id) || '' })
+      React.useEffect(function () {
+        let alive = true
+        const cached = thumbUrls.get(entry.id)
+        if (cached) {
+          setUrl(cached)
+          return undefined
+        }
+        getImage(entry.id).then(function (record) {
+          if (!alive || !record || !record.blob) return
+          const next = URL.createObjectURL(record.blob)
+          thumbUrls.set(entry.id, next)
+          setUrl(next)
+        }).catch(function () { /* 图没了就只是不显示 */ })
+        return function () { alive = false }
+      }, [entry.id])
+      return url
+    }
+
+    function Thumb(props) {
+      const url = useThumbUrl(props.image)
+      if (!url) return h('span', { className: 'dsmq-thumb dsmq-thumb-empty' }, '')
+      return h('img', {
+        className: 'dsmq-thumb',
+        src: url,
+        alt: props.image.name || '',
+        title: props.image.name || '',
+      })
+    }
+
     function normalizeItems(raw) {
       const out = []
       if (!Array.isArray(raw)) return out
       for (const entry of raw) {
-        if (!entry || typeof entry.text !== 'string') continue
-        const text = cleanText(entry.text)
-        if (!text) continue
+        if (!entry) continue
+        const text = cleanText(typeof entry.text === 'string' ? entry.text : '')
+        const images = normalizeImages(entry.images)
+        if (!text && images.length === 0) continue
         out.push({
           id: typeof entry.id === 'string' && entry.id ? entry.id : uid(),
           text,
+          images,
           at: typeof entry.at === 'number' ? entry.at : Date.now(),
         })
       }
@@ -141,27 +253,44 @@ window.__ModuleLoader__.load({
 
     function addItem(text, options) {
       const body = cleanText(text)
-      if (!body) return null
-      const item = { id: uid(), text: body, at: Date.now() }
+      const images = normalizeImages(options && options.images)
+      if (!body && images.length === 0) return null
+      const item = { id: uid(), text: body, images, at: Date.now() }
       patch({ items: snapshot.items.concat([item]), collapsed: false })
       writeJson(UI_KEY, { collapsed: false })
       if (!options || options.notice !== false) notify('已加入队列')
       return item
     }
 
-    function updateItem(id, text) {
+    function updateItem(id, text, images) {
       const body = cleanText(text)
-      if (!body) return
+      const nextImages = images === undefined ? undefined : normalizeImages(images)
+      if (!body && (!nextImages || nextImages.length === 0)) return
       patch({
         items: snapshot.items.map(function (item) {
-          return item.id === id ? Object.assign({}, item, { text: body }) : item
+          if (item.id !== id) return item
+          const next = Object.assign({}, item, { text: body })
+          if (nextImages) next.images = nextImages
+          return next
         }),
       })
       notify('已更新')
     }
 
     function removeItem(id) {
+      const target = snapshot.items.filter(function (item) { return item.id === id })[0]
       patch({ items: snapshot.items.filter(function (item) { return item.id !== id }) })
+      if (target && target.images && target.images.length > 0) {
+        const ids = target.images.map(function (image) { return image.id })
+        for (const imageId of ids) {
+          const url = thumbUrls.get(imageId)
+          if (url) {
+            try { URL.revokeObjectURL(url) } catch (err) { /* 忽略 */ }
+            thumbUrls.delete(imageId)
+          }
+        }
+        dropImages(ids)
+      }
     }
 
     /* ══════════════════════════ 左栏几何 ══════════════════════════ */
@@ -236,11 +365,15 @@ window.__ModuleLoader__.load({
         notify('先打开一个会话再发送')
         return
       }
-      const preserved = sender.send(item.text)
-      removeItem(id)
-      if (!preserved) notify('已发送')
-      // 发出去就收起面板（点了「发送」就不用再点一次底部按钮）
-      setCollapsed(true)
+      Promise.resolve(sender.send(item.text, item.images)).then(function (accepted) {
+        if (!accepted) return
+        removeItem(id)
+        notify('已发送')
+        // 发出去就收起面板（点了「发送」就不用再点一次底部按钮）
+        setCollapsed(true)
+      }).catch(function (err) {
+        notify('发送失败：' + String(err && err.message ? err.message : err))
+      })
     }
 
     /* ══════════════════════════ ③ 投递器 ══════════════════════════ */
@@ -249,11 +382,56 @@ window.__ModuleLoader__.load({
       return state && typeof state.draft === 'string' ? state.draft : ''
     }
 
+    const ATTACH_COUNT_SELECTOR = function (state) {
+      return state && Array.isArray(state.attachmentIds) ? state.attachmentIds.length : 0
+    }
+
     function readNothing() {
       return ''
     }
 
-    function useSenderRegistration(props, readDraft) {
+    function readZero() {
+      return 0
+    }
+
+    function wait(ms) {
+      return new Promise(function (resolve) { setTimeout(resolve, ms) })
+    }
+
+    /**
+     * 找到当前会话的输入编辑区（Lexical 的 contenteditable，取面积最大的那个）。
+     * 只用来给它派发 paste，不读它的内容、不改它的 DOM。
+     */
+    function composerEditor() {
+      try {
+        const nodes = document.querySelectorAll('[contenteditable="true"]')
+        let best = null
+        for (const node of nodes) {
+          if (!node || !node.isConnected) continue
+          const rect = node.getBoundingClientRect()
+          if (rect.width < 40 || rect.height < 10) continue
+          const area = rect.width * rect.height
+          if (!best || area > best.area) best = { node, area }
+        }
+        return best ? best.node : null
+      } catch (err) {
+        return null
+      }
+    }
+
+    function fileOfRecord(record, image) {
+      try {
+        const blob = record.blob
+        if (!blob) return null
+        const type = record.type || image.type || 'image/png'
+        const name = record.name || image.name || 'image.png'
+        return new File([blob], name, { type })
+      } catch (err) {
+        return null
+      }
+    }
+
+    function useSenderRegistration(props, readDraft, readAttachCount) {
       const actions = props.inputActions
       React.useEffect(function () {
         if (!actions
@@ -262,51 +440,107 @@ window.__ModuleLoader__.load({
           return undefined
         }
         return registerSender({
-          /** @returns {boolean} 是否顺手把输入框里的草稿存进了队列。 */
-          send(text) {
+          /** @returns {Promise<boolean>} 是否已经真的提交出去。 */
+          async send(text, images) {
             let draft = ''
             try {
               draft = String(readDraft() || '')
             } catch (err) {
               draft = ''
             }
-            const preserved = !!draft.trim()
             // 输入框里有草稿时先把它收进队列：绝不因为发一条队列消息而吞掉用户正在写的东西。
-            if (preserved) {
+            if (draft.trim()) {
               addItem(draft, { notice: false })
               notify('输入框草稿已存入队列')
             }
-            actions.setDraft(text)
-            setTimeout(function () {
-              try {
-                actions.submit()
-              } catch (err) {
-                notify('发送失败：' + String(err && err.message ? err.message : err))
+
+            const list = Array.isArray(images) ? images : []
+            if (list.length > 0) {
+              // 官方没有"从别处往草稿里加附件"的公开 API（onAddFiles 只发给附件栏那一个座位），
+              // 所以对编辑区派发一次合成 paste：它自己的粘贴上传路径会接住，走的是同一条校验/上传线。
+              const editor = composerEditor()
+              if (!editor) {
+                notify('找不到输入框，这条先留在队列里')
+                return false
               }
-            }, SUBMIT_DELAY_MS)
-            return preserved
+              const before = readAttachCount()
+              let dispatched = 0
+              for (const image of list) {
+                let record = null
+                try {
+                  record = await getImage(image.id)
+                } catch (err) {
+                  record = null
+                }
+                if (!record || !record.blob) continue
+                const file = fileOfRecord(record, image)
+                if (!file) continue
+                try {
+                  const data = new DataTransfer()
+                  data.items.add(file)
+                  editor.dispatchEvent(new ClipboardEvent('paste', {
+                    clipboardData: data,
+                    bubbles: true,
+                    cancelable: true,
+                  }))
+                  dispatched += 1
+                } catch (err) {
+                  /* 贴不进去就跳过这一张 */
+                }
+                await wait(120)
+              }
+              if (dispatched === 0) {
+                notify('图片读不出来，这条先留在队列里')
+                return false
+              }
+              const deadline = Date.now() + 2500
+              while (Date.now() < deadline && readAttachCount() < before + dispatched) {
+                await wait(80)
+              }
+              if (readAttachCount() < before + dispatched) {
+                notify('图片没能自动附进输入框，这条先留在队列里')
+                return false
+              }
+            }
+
+            actions.setDraft(text || '')
+            await wait(SUBMIT_DELAY_MS)
+            try {
+              actions.submit()
+            } catch (err) {
+              notify('发送失败：' + String(err && err.message ? err.message : err))
+              return false
+            }
+            return true
           },
         })
-      }, [actions, readDraft])
+      }, [actions, readDraft, readAttachCount])
       return null
     }
 
-    /** 输入机没有暴露草稿快照时的兜底：只发送，不碰草稿。 */
+    /** 输入机没有暴露草稿快照时的兜底：只发送，不碰草稿、不发图。 */
     function SenderPlain(props) {
-      useSenderRegistration(props, readNothing)
+      useSenderRegistration(props, readNothing, readZero)
       return null
     }
 
-    /** 正常路径：订阅当前会话的输入状态，发送前保住草稿。 */
+    /** 正常路径：订阅当前会话的输入状态（草稿 + 附件数），发送前保住草稿。 */
     function SenderWithDraft(props) {
       const draft = props.useInput(DRAFT_SELECTOR)
-      const latest = React.useRef('')
-      latest.current = draft
+      const attachCount = props.useInput(ATTACH_COUNT_SELECTOR)
+      const latestDraft = React.useRef('')
+      latestDraft.current = draft
+      const latestCount = React.useRef(0)
+      latestCount.current = attachCount
       const readDraft = React.useRef(null)
       if (!readDraft.current) {
-        readDraft.current = function () { return latest.current }
+        readDraft.current = function () { return latestDraft.current }
       }
-      useSenderRegistration(props, readDraft.current)
+      const readCount = React.useRef(null)
+      if (!readCount.current) {
+        readCount.current = function () { return latestCount.current }
+      }
+      useSenderRegistration(props, readDraft.current, readCount.current)
       return null
     }
 
@@ -321,14 +555,6 @@ window.__ModuleLoader__.load({
       const [, force] = React.useReducer(function (n) { return n + 1 }, 0)
       React.useEffect(function () { return subscribe(force) }, [])
       return snapshot
-    }
-
-    function formatTime(at) {
-      try {
-        return new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-      } catch (err) {
-        return ''
-      }
     }
 
     /* ══════════════════════════ ① 左栏底部按钮 ══════════════════════════ */
@@ -453,31 +679,41 @@ window.__ModuleLoader__.load({
       'color:var(--dsw-alias-label-primary,#1b1c20);font:12px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}',
 
       '.dsmq-body{display:flex;flex-direction:column;gap:6px;padding:8px 10px 9px}',
-      '.dsmq-input{width:100%;box-sizing:border-box;resize:vertical;min-height:48px;max-height:120px;',
-      'padding:5px 7px;border-radius:6px;font:inherit;color:inherit;outline:none;',
-      'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.3));',
-      'background:var(--dsw-alias-bg-base,#fff)}',
-      '.dsmq-input:focus{border-color:var(--dsw-alias-brand-primary,#4d93f8)}',
-      '.dsmq-input::placeholder{color:var(--dsw-alias-label-secondary,#9aa0a8)}',
+      '.dsmq-input{width:100%;box-sizing:border-box;resize:none;min-height:54px;max-height:116px;padding:6px 9px;',
+      'border-radius:8px;font-family:inherit;font-size:13px;line-height:20px;color:inherit;outline:none;',
+      'transition:border-color .12s ease,box-shadow .12s ease;',
+      'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.28));background:var(--dsw-alias-bg-base,#fff)}',
+      '.dsmq-input:hover{border-color:var(--dsw-alias-border-l2,rgba(127,127,127,.45))}',
+      '.dsmq-input:focus{border-color:var(--dsw-alias-brand-primary,#4d93f8);box-shadow:0 0 0 2px rgba(77,147,248,.18)}',
+      '.dsmq-input::placeholder{color:var(--dsw-alias-label-tertiary,#9aa0a8)}',
 
-      '.dsmq-row{display:flex;align-items:center;gap:6px}',
-      '.dsmq-hint{flex:1;min-width:0;font-size:11px;color:var(--dsw-alias-label-secondary,#5c626b)}',
-      '.dsmq-btn{box-sizing:border-box;padding:2px 8px;border-radius:6px;font:inherit;color:inherit;cursor:pointer;',
-      'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.32));background:transparent}',
-      '.dsmq-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.12))}',
-      '.dsmq-btn:disabled{opacity:.45;cursor:not-allowed}',
-      '.dsmq-btn-primary{border-color:transparent;background:var(--dsw-alias-brand-primary,#4d93f8);color:#fff}',
-      '.dsmq-btn-primary:hover:not(:disabled){background:var(--dsw-alias-brand-primary,#4d93f8);filter:brightness(1.07)}',
+      /* 输入框右下角的「+」：选图 → 存 IndexedDB → 缩略图挂在下面 */
+      '.dsmq-field{position:relative;display:flex}',
+      '.dsmq-input-draft{padding-right:32px}',
+      '.dsmq-add{position:absolute;right:5px;bottom:5px;width:22px;height:22px;padding:0;border-radius:6px;',
+      'display:flex;align-items:center;justify-content:center;cursor:pointer;font:14px/1 system-ui;',
+      'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.3));background:var(--dsw-alias-bg-base,#fff);',
+      'color:var(--dsw-alias-label-secondary,#5c626b)}',
+      '.dsmq-add:hover{color:var(--dsw-alias-label-primary,#1b1c20);border-color:var(--dsw-alias-border-l2,rgba(127,127,127,.5))}',
+      '.dsmq-thumbs{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}',
+      '.dsmq-thumb-wrap{position:relative;display:block;width:44px;height:44px}',
+      '.dsmq-thumb{display:block;width:44px;height:44px;object-fit:cover;border-radius:6px;',
+      'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));',
+      'background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.1))}',
+      '.dsmq-thumb-x{position:absolute;top:-4px;right:-4px;width:16px;height:16px;padding:0;border-radius:8px;border:0;',
+      'display:flex;align-items:center;justify-content:center;cursor:pointer;font:11px/1 system-ui;',
+      'background:var(--dsw-alias-bg-layer-2,rgba(80,84,90,.9));color:var(--dsw-alias-label-primary,#fff)}',
 
-      /* 列表条目做成侧栏行的样子：无卡片边框，悬停才浮出背景 */
-      /* 最多露两条，再多就在这一块里滚动，绝不越滚越长 */
-      '.dsmq-list{display:flex;flex-direction:column;gap:1px;max-height:156px;overflow:auto;margin:0 -4px}',
-      '.dsmq-item{padding:4px 5px;border-radius:6px}',
-      '.dsmq-item:hover{background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.08))}',
+      /* 每条做成一张轻卡片：浅底 + 1px 描边 + 圆角，跟上面输入框是一套语言 */
+      '.dsmq-list{display:flex;flex-direction:column;gap:6px;max-height:156px;overflow:auto;margin:0 -2px;padding:0 2px}',
+      '.dsmq-item{padding:6px 8px;border-radius:8px;transition:border-color .12s ease;',
+      'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));',
+      'background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.05))}',
+      '.dsmq-item:hover{border-color:var(--dsw-alias-border-l2,rgba(127,127,127,.45))}',
       '.dsmq-text{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}',
-      '.dsmq-meta{display:flex;align-items:center;gap:2px;margin-top:3px;opacity:.6;transition:opacity .12s ease}',
+      '.dsmq-meta{display:flex;align-items:center;justify-content:flex-end;gap:2px;margin-top:2px;',
+      'opacity:.6;transition:opacity .12s ease}',
       '.dsmq-item:hover .dsmq-meta,.dsmq-item:focus-within .dsmq-meta{opacity:1}',
-      '.dsmq-time{flex:1;min-width:0;font-size:11px;color:var(--dsw-alias-label-secondary,#5c626b)}',
       '.dsmq-link{padding:1px 5px;border:0;border-radius:5px;background:transparent;color:inherit;',
       'font:inherit;font-size:11px;cursor:pointer;color:var(--dsw-alias-label-secondary,#5c626b)}',
       '.dsmq-link:hover{background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.16));color:var(--dsw-alias-label-primary,#1b1c20)}',
@@ -492,8 +728,11 @@ window.__ModuleLoader__.load({
     function QueuePanel() {
       const state = useSnapshot()
       const [draft, setDraft] = React.useState('')
+      const [staged, setStaged] = React.useState([])
       const [editingId, setEditingId] = React.useState('')
       const [editText, setEditText] = React.useState('')
+      const [editImages, setEditImages] = React.useState([])
+      const fileRef = React.useRef(null)
 
       const anchor = state.anchor
       const items = state.items
@@ -521,10 +760,64 @@ window.__ModuleLoader__.load({
       // 收起来时同样什么都不画：开关与计数都在①号那个左栏底部按钮上，这里不再重复一行标题。
       if (!anchor || anchor.width < RAIL_MAX_WIDTH || state.collapsed) return null
 
+      function forgetImage(imageId) {
+        const url = thumbUrls.get(imageId)
+        if (url) {
+          try { URL.revokeObjectURL(url) } catch (err) { /* 忽略 */ }
+          thumbUrls.delete(imageId)
+        }
+        dropImages([imageId])
+      }
+
+      async function addFiles(fileList) {
+        const files = Array.from(fileList || [])
+        if (files.length === 0) return
+        const next = staged.slice()
+        for (const file of files) {
+          if (!file || !/^image\//.test(file.type || '')) continue
+          if (file.size > MAX_IMAGE_BYTES) {
+            notify('图片太大（上限 8MB）')
+            continue
+          }
+          const entry = {
+            id: 'img' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+            name: file.name || 'image',
+            type: file.type || 'image/png',
+          }
+          try {
+            await putImage(entry.id, { blob: file, name: entry.name, type: entry.type })
+          } catch (err) {
+            notify('图片存不下：' + String(err && err.message ? err.message : err))
+            continue
+          }
+          next.push(entry)
+        }
+        setStaged(next)
+      }
+
       function commitDraft() {
-        if (!cleanText(draft)) return
-        addItem(draft)
+        const text = cleanText(draft)
+        if (!text && staged.length === 0) return
+        addItem(text, { images: staged })
         setDraft('')
+        setStaged([])
+      }
+
+      function imageStrip(images, onRemove) {
+        if (!images || images.length === 0) return null
+        return h('div', { className: 'dsmq-thumbs' }, images.map(function (image) {
+          return h('span', { className: 'dsmq-thumb-wrap', key: image.id },
+            h(Thumb, { image }),
+            onRemove
+              ? h('button', {
+                type: 'button',
+                className: 'dsmq-thumb-x',
+                title: '移除这张图',
+                onClick() { onRemove(image) },
+              }, '×')
+              : null
+          )
+        }))
       }
 
       const frameStyle = {
@@ -551,13 +844,17 @@ window.__ModuleLoader__.load({
                   }
                   if (isPlainEnter(event)) {
                     event.preventDefault()
-                    updateItem(item.id, editText)
+                    if (!cleanText(editText) && editImages.length === 0) return
+                    updateItem(item.id, editText, editImages)
                     setEditingId('')
                   }
                 },
               }),
+              imageStrip(editImages, function (image) {
+                setEditImages(editImages.filter(function (entry) { return entry.id !== image.id }))
+                forgetImage(image.id)
+              }),
               h('div', { className: 'dsmq-meta' },
-                h('span', { className: 'dsmq-time' }, '回车保存 · Shift+回车换行'),
                 h('button', {
                   type: 'button',
                   className: 'dsmq-link',
@@ -566,9 +863,9 @@ window.__ModuleLoader__.load({
                 h('button', {
                   type: 'button',
                   className: 'dsmq-link dsmq-link-send',
-                  disabled: !cleanText(editText),
+                  disabled: !cleanText(editText) && editImages.length === 0,
                   onClick() {
-                    updateItem(item.id, editText)
+                    updateItem(item.id, editText, editImages)
                     setEditingId('')
                   },
                 }, '保存')
@@ -576,9 +873,9 @@ window.__ModuleLoader__.load({
             )
           }
           return h('div', { className: 'dsmq-item', key: item.id },
-            h('div', { className: 'dsmq-text', title: item.text }, item.text),
+            item.text ? h('div', { className: 'dsmq-text', title: item.text }, item.text) : null,
+            imageStrip(item.images, null),
             h('div', { className: 'dsmq-meta' },
-              h('span', { className: 'dsmq-time' }, formatTime(item.at)),
               h('button', {
                 type: 'button',
                 className: 'dsmq-link',
@@ -586,6 +883,7 @@ window.__ModuleLoader__.load({
                 onClick() {
                   setEditingId(item.id)
                   setEditText(item.text)
+                  setEditImages(item.images || [])
                 },
               }, '编辑'),
               h('button', {
@@ -609,27 +907,43 @@ window.__ModuleLoader__.load({
         })
 
       const body = h('div', { className: 'dsmq-body' },
-        h('textarea', {
-          className: 'dsmq-input',
-          value: draft,
-          placeholder: '想到什么先写这里，合适的时机再发送…',
-          onChange(event) { setDraft(event.target.value) },
-          onKeyDown(event) {
-            if (isPlainEnter(event)) {
-              event.preventDefault()
-              commitDraft()
-            }
-          },
-        }),
-        h('div', { className: 'dsmq-row' },
-          h('span', { className: 'dsmq-hint' }, '回车加入 · Shift+回车换行'),
+        h('div', { className: 'dsmq-field' },
+          h('textarea', {
+            className: 'dsmq-input dsmq-input-draft',
+            value: draft,
+            placeholder: '想到什么先写这里，回车加入（Shift+回车换行）…',
+            onChange(event) { setDraft(event.target.value) },
+            onKeyDown(event) {
+              if (isPlainEnter(event)) {
+                event.preventDefault()
+                commitDraft()
+              }
+            },
+          }),
           h('button', {
             type: 'button',
-            className: 'dsmq-btn dsmq-btn-primary',
-            disabled: !cleanText(draft),
-            onClick: commitDraft,
-          }, '加入')
+            className: 'dsmq-add',
+            title: '添加图片',
+            'aria-label': '添加图片',
+            onClick() { if (fileRef.current) fileRef.current.click() },
+          }, '+'),
+          h('input', {
+            type: 'file',
+            accept: 'image/*',
+            multiple: true,
+            ref: fileRef,
+            style: { display: 'none' },
+            onChange(event) {
+              const files = event.target.files
+              event.target.value = ''
+              addFiles(files)
+            },
+          })
         ),
+        imageStrip(staged, function (image) {
+          setStaged(staged.filter(function (entry) { return entry.id !== image.id }))
+          forgetImage(image.id)
+        }),
         h('div', { className: 'dsmq-list' }, list),
         state.notice ? h('div', { className: 'dsmq-notice' }, state.notice) : null
       )
