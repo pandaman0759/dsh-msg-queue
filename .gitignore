@@ -1,0 +1,4 @@
+﻿.shot-*.png
+.tmp-*
+node_modules/
+
