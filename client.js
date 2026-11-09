@@ -85,6 +85,10 @@ window.__ModuleLoader__.load({
       dbPromise = new Promise(function (resolve, reject) {
         let req
         try {
+          if (!window.indexedDB) {
+            reject(new Error('这个环境没有 IndexedDB'))
+            return
+          }
           req = window.indexedDB.open(DB_NAME, 1)
         } catch (err) {
           reject(err)
@@ -95,8 +99,11 @@ window.__ModuleLoader__.load({
           if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE)
         }
         req.onsuccess = function () { resolve(req.result) }
-        req.onerror = function () { reject(req.error) }
+        req.onblocked = function () { reject(new Error('IndexedDB 被另一个标签页占用')) }
+        req.onerror = function () { reject(req.error || new Error('打不开 IndexedDB')) }
       })
+      // 失败不要把失败的 promise 缓存住，下次还能重试
+      dbPromise.catch(function () { dbPromise = null })
       return dbPromise
     }
 
@@ -236,13 +243,14 @@ window.__ModuleLoader__.load({
     }
 
     let noticeTimer = null
-    function notify(text) {
+    function notify(text, durationMs) {
       patch({ notice: String(text || '') })
       if (noticeTimer) clearTimeout(noticeTimer)
+      const ttl = typeof durationMs === 'number' && durationMs > 0 ? durationMs : NOTICE_MS
       noticeTimer = setTimeout(function () {
         noticeTimer = null
         patch({ notice: '' })
-      }, NOTICE_MS)
+      }, ttl)
     }
 
     function setCollapsed(collapsed) {
@@ -386,6 +394,10 @@ window.__ModuleLoader__.load({
       return state && Array.isArray(state.attachmentIds) ? state.attachmentIds.length : 0
     }
 
+    const PHASE_SELECTOR = function (state) {
+      return state && typeof state.phase === 'string' ? state.phase : 'plain'
+    }
+
     function readNothing() {
       return ''
     }
@@ -431,7 +443,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function useSenderRegistration(props, readDraft, readAttachCount) {
+    function useSenderRegistration(props, readDraft, readAttachCount, readPhase) {
       const actions = props.inputActions
       React.useEffect(function () {
         if (!actions
@@ -454,7 +466,10 @@ window.__ModuleLoader__.load({
               notify('输入框草稿已存入队列')
             }
 
+            const expected = String(text || '')
             const list = Array.isArray(images) ? images : []
+            const before = readAttachCount()
+
             if (list.length > 0) {
               // 官方没有"从别处往草稿里加附件"的公开 API（onAddFiles 只发给附件栏那一个座位），
               // 所以对编辑区派发一次合成 paste：它自己的粘贴上传路径会接住，走的是同一条校验/上传线。
@@ -463,7 +478,6 @@ window.__ModuleLoader__.load({
                 notify('找不到输入框，这条先留在队列里')
                 return false
               }
-              const before = readAttachCount()
               let dispatched = 0
               for (const image of list) {
                 let record = null
@@ -493,7 +507,7 @@ window.__ModuleLoader__.load({
                 notify('图片读不出来，这条先留在队列里')
                 return false
               }
-              const deadline = Date.now() + 2500
+              const deadline = Date.now() + 4000
               while (Date.now() < deadline && readAttachCount() < before + dispatched) {
                 await wait(80)
               }
@@ -503,35 +517,62 @@ window.__ModuleLoader__.load({
               }
             }
 
-            actions.setDraft(text || '')
+            actions.setDraft(expected)
             await wait(SUBMIT_DELAY_MS)
-            try {
-              actions.submit()
-            } catch (err) {
-              notify('发送失败：' + String(err && err.message ? err.message : err))
-              return false
+
+            /* 附件是异步上传的：附件总数到齐 ≠ 上传完成，这时提交会被宿主拒绝
+               （toast：one or more files have not finished uploading）。所以提交后看结果，
+               没进去就等一会儿再提交一次，最多约 8 次。 */
+            for (let attempt = 0; attempt < 8; attempt += 1) {
+              try {
+                actions.submit()
+              } catch (err) {
+                notify('发送失败：' + String(err && err.message ? err.message : err))
+                return false
+              }
+              await wait(attempt === 0 ? 450 : 350)
+              const phase = readPhase()
+              if (phase !== 'plain') return true
+              let now = ''
+              try {
+                now = String(readDraft() || '')
+              } catch (err) {
+                now = ''
+              }
+              if (now !== expected) return true
+              if (readAttachCount() < before) return true
+              if (attempt === 7) break
+              await wait(250)
             }
-            return true
+            notify('没发出去（附件可能还在上传），这条先留在队列里')
+            return false
           },
         })
-      }, [actions, readDraft, readAttachCount])
+      }, [actions, readDraft, readAttachCount, readPhase])
       return null
     }
 
     /** 输入机没有暴露草稿快照时的兜底：只发送，不碰草稿、不发图。 */
     function SenderPlain(props) {
-      useSenderRegistration(props, readNothing, readZero)
+      useSenderRegistration(props, readNothing, readZero, readPlainPhase)
       return null
     }
 
-    /** 正常路径：订阅当前会话的输入状态（草稿 + 附件数），发送前保住草稿。 */
+    function readPlainPhase() {
+      return 'plain'
+    }
+
+    /** 正常路径：订阅当前会话的输入状态（草稿 + 附件数 + 提交相位），发送前保住草稿。 */
     function SenderWithDraft(props) {
       const draft = props.useInput(DRAFT_SELECTOR)
       const attachCount = props.useInput(ATTACH_COUNT_SELECTOR)
+      const phase = props.useInput(PHASE_SELECTOR)
       const latestDraft = React.useRef('')
       latestDraft.current = draft
       const latestCount = React.useRef(0)
       latestCount.current = attachCount
+      const latestPhase = React.useRef('plain')
+      latestPhase.current = phase
       const readDraft = React.useRef(null)
       if (!readDraft.current) {
         readDraft.current = function () { return latestDraft.current }
@@ -540,7 +581,11 @@ window.__ModuleLoader__.load({
       if (!readCount.current) {
         readCount.current = function () { return latestCount.current }
       }
-      useSenderRegistration(props, readDraft.current, readCount.current)
+      const readPhase = React.useRef(null)
+      if (!readPhase.current) {
+        readPhase.current = function () { return latestPhase.current }
+      }
+      useSenderRegistration(props, readDraft.current, readCount.current, readPhase.current)
       return null
     }
 
@@ -773,26 +818,36 @@ window.__ModuleLoader__.load({
         const files = Array.from(fileList || [])
         if (files.length === 0) return
         const next = staged.slice()
+        let added = 0
+        let lastError = ''
         for (const file of files) {
-          if (!file || !/^image\//.test(file.type || '')) continue
+          if (!file) continue
+          const type = file.type || ''
+          if (type && !/^image\//.test(type)) {
+            lastError = '只收图片'
+            continue
+          }
           if (file.size > MAX_IMAGE_BYTES) {
-            notify('图片太大（上限 8MB）')
+            lastError = '图片太大（上限 8MB）'
             continue
           }
           const entry = {
             id: 'img' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
             name: file.name || 'image',
-            type: file.type || 'image/png',
+            type: type || 'image/png',
           }
           try {
             await putImage(entry.id, { blob: file, name: entry.name, type: entry.type })
           } catch (err) {
-            notify('图片存不下：' + String(err && err.message ? err.message : err))
+            lastError = String(err && err.message ? err.message : err)
             continue
           }
           next.push(entry)
+          added += 1
         }
         setStaged(next)
+        if (added > 0) notify(added === 1 ? '图片已加入' : ('已加入 ' + added + ' 张图'))
+        else if (lastError) notify('存不下图：' + lastError)
       }
 
       function commitDraft() {
@@ -934,9 +989,11 @@ window.__ModuleLoader__.load({
             ref: fileRef,
             style: { display: 'none' },
             onChange(event) {
-              const files = event.target.files
+              // ⚠️ 先把 FileList 抄成数组再清空 value：清空会让 FileList 变空，
+              // 之前就是"清完再读"→ 一张都读不到。
+              const picked = Array.from(event.target.files || [])
               event.target.value = ''
-              addFiles(files)
+              addFiles(picked)
             },
           })
         ),
